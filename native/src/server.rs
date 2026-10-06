@@ -11,7 +11,9 @@ use pyo3::types::PyBytes;
 use pyo3::types::PyString;
 use pyo3::Python;
 use serde_json::json;
+use socket2::{SockRef, TcpKeepalive};
 use std::env;
+use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
 use tokio_tungstenite::{accept_async, accept_hdr_async};
 
@@ -97,7 +99,26 @@ impl AppServer {
         }
     }
 
+    /// 给连接设置激进的 TCP keepalive。
+    /// 音箱 reboot（硬断、无 FIN）时对端半开；不设 keepalive 的话内核默认
+    /// 7200s 才探测，process_messages() 的 reader.next() 会永久阻塞，
+    /// 而本 server 的 accept 循环是「同一时刻只处理一个连接」的同步 await，
+    /// 于是新 client 永远无法被 accept、WS 握手卡死（表现为 TCP ESTABLISHED
+    /// 但 client 不打印「已连接」，重启容器才恢复）。
+    /// 设 30s/10s×3 后，半开连接约 60s 内被内核判定死亡并关闭，
+    /// reader.next() 返回错误 → handle_connection 返回 → accept 循环继续。
+    fn set_tcp_keepalive(stream: &TcpStream) -> std::io::Result<()> {
+        let keepalive = TcpKeepalive::new()
+            .with_time(Duration::from_secs(30))
+            .with_interval(Duration::from_secs(10))
+            .with_retries(3);
+        SockRef::from(stream).set_tcp_keepalive(&keepalive)
+    }
+
     async fn handle_connection(stream: TcpStream, addr: std::net::SocketAddr) {
+        if let Err(e) = Self::set_tcp_keepalive(&stream) {
+            crate::pylog!("[AppServer] ⚠️ 设置 TCP keepalive 失败: {}", e);
+        }
         let ws_stream = match AppServer::connect(stream).await {
             Ok(ws_stream) => ws_stream,
             Err(e) => {
